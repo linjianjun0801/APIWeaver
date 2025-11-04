@@ -1,32 +1,38 @@
 """
-FastAPI-based admin HTTP interface for APIWeaver.
+FastAPI admin HTTP interface with multi-server support.
 
-Routes:
-- POST /admin/register      -> register an API (body: API config JSON)
-- POST /admin/unregister    -> unregister (body: {"api_name":"..."})
-- GET  /admin/list          -> list registered APIs
-- POST /admin/test          -> test connection (body: {"api_name":"..."})
-- GET  /admin/schema/{api_name} -> get schema, optional ?endpoint=xxx
+Routes (server-scoped):
+- POST /admin/{server_name}/register      -> register an API (body: API config JSON)
+- POST /admin/{server_name}/unregister    -> unregister (body: {"api_name":"..."})
+- GET  /admin/{server_name}/list          -> list registered APIs for that server
+- POST /admin/{server_name}/test          -> test connection (body: {"api_name":"..."})
+- GET  /admin/{server_name}/schema/{api_name} -> get schema, optional ?endpoint=xxx
 
-Persistent storage: ./apis.json (configurable)
+Behavior:
+- Persist configs into single apis.json organized by server name (see storage.JsonStore).
+- On FastAPI startup loads all servers and registers their APIs into per-server APIWeaver instances.
+- Each server gets its own APIWeaver instance stored in `weavers` dict.
+- Note: running multiple MCP transports (HTTP ports) from same process requires configuring each APIWeaver.run(...) appropriately
 """
 from typing import Optional, Dict, Any
 import asyncio
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
 import uvicorn
 
 from .storage import JsonStore
 from .server import APIWeaver
-from .models import APIConfig  # 使用库中已有的 Pydantic 模型
+from .models import APIConfig  # reuse repo models
 
-app = FastAPI(title="APIWeaver Admin", version="0.1.0")
+app = FastAPI(title="APIWeaver Admin (multi-server)", version="0.1.0")
 store = JsonStore("apis.json")
-weaver = APIWeaver()  # 在同一进程中持有 APIWeaver 实例
+
+# Map server_name -> APIWeaver instance
+weavers: Dict[str, APIWeaver] = {}
 _startup_lock = asyncio.Lock()
 
-# Pydantic 请求模型（可直接传入任意 JSON，内部使用 APIConfig 校验）
+# Request models
 class RegisterPayload(BaseModel):
     config: Dict[str, Any]
 
@@ -36,37 +42,49 @@ class UnregisterPayload(BaseModel):
 class TestPayload(BaseModel):
     api_name: str
 
+async def _ensure_weaver_for(server_name: str) -> APIWeaver:
+    """
+    Ensure an APIWeaver instance exists for server_name.
+    If it does not exist, create one and keep it in weavers.
+    (We do not automatically call its .run() here; you can run it separately.)
+    """
+    if server_name in weavers:
+        return weavers[server_name]
+    # Create new APIWeaver instance with a unique name
+    weaver = APIWeaver(name=f"APIWeaver-{server_name}")
+    weavers[server_name] = weaver
+    return weaver
+
 @app.on_event("startup")
 async def startup_event():
     """
-    Load persisted configs from apis.json and register them into weaver.
-    This replicates what register_api does so the MCP tools are created.
+    Load persisted configs from apis.json and register them into per-server weavers.
     """
     async with _startup_lock:
-        data = await store.load_all()
-        for name, cfg in data.items():
+        all_servers = await store.load_all_servers()
+        for server_name, apis in all_servers.items():
             try:
-                # Validate/cast via APIConfig model
-                api_config = APIConfig(**cfg)
-                # store in weaver
-                weaver.apis[api_config.name] = api_config
-                client = await weaver._create_http_client(api_config)
-                weaver.http_clients[api_config.name] = client
-                # create endpoint tools
-                for ep in api_config.endpoints:
-                    tool_name = f"{api_config.name}_{ep.name}"
-                    # _create_endpoint_tool registers into weaver.mcp
-                    await weaver._create_endpoint_tool(api_config, ep, tool_name)
-                app.logger = getattr(app, "logger", None)  # placeholder
+                weaver = await _ensure_weaver_for(server_name)
+                # register each api in that server
+                for name, cfg in apis.items():
+                    try:
+                        api_config = APIConfig(**cfg)
+                        weaver.apis[api_config.name] = api_config
+                        client = await weaver._create_http_client(api_config)
+                        weaver.http_clients[api_config.name] = client
+                        for ep in api_config.endpoints:
+                            tool_name = f"{api_config.name}_{ep.name}"
+                            await weaver._create_endpoint_tool(api_config, ep, tool_name)
+                    except Exception as e:
+                        print(f"[admin startup] server={server_name} failed to load api={name}: {e}")
             except Exception as e:
-                # Skip invalid entries but don't crash startup
-                print(f"[admin startup] failed to load {name}: {e}")
+                print(f"[admin startup] failed to init weaver for server={server_name}: {e}")
 
-@app.post("/admin/register")
-async def admin_register(payload: RegisterPayload):
+@app.post("/admin/{server_name}/register")
+async def admin_register(server_name: str, payload: RegisterPayload):
     """
-    Register new API config and persist it.
-    Body example: { "config": { ... API config as in README ... } }
+    Register new API config under server_name and persist it.
+    Body: {"config": { ... API config ... }}
     """
     config = payload.config
     try:
@@ -75,8 +93,10 @@ async def admin_register(payload: RegisterPayload):
         raise HTTPException(status_code=400, detail=f"Invalid config: {e}")
 
     name = api_config.name
+    # ensure weaver instance
+    weaver = await _ensure_weaver_for(server_name)
     if name in weaver.apis:
-        raise HTTPException(status_code=400, detail=f"API '{name}' already registered")
+        raise HTTPException(status_code=400, detail=f"API '{name}' already registered on server '{server_name}'")
 
     try:
         # Create client and tools (same logic as register_api)
@@ -90,10 +110,10 @@ async def admin_register(payload: RegisterPayload):
             await weaver._create_endpoint_tool(api_config, ep, tool_name)
             created.append(tool_name)
 
-        # persist
-        await store.add_api(name, config)
+        # persist under server
+        await store.add_api(server_name, name, config)
 
-        return {"status": "ok", "message": f"Registered {name}", "created_tools": created}
+        return {"status": "ok", "message": f"Registered {name} on server {server_name}", "created_tools": created}
     except Exception as e:
         # Cleanup on failure
         if name in weaver.http_clients:
@@ -103,11 +123,12 @@ async def admin_register(payload: RegisterPayload):
             del weaver.apis[name]
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/admin/unregister")
-async def admin_unregister(payload: UnregisterPayload):
+@app.post("/admin/{server_name}/unregister")
+async def admin_unregister(server_name: str, payload: UnregisterPayload):
     name = payload.api_name
-    if name not in weaver.apis:
-        raise HTTPException(status_code=404, detail=f"API '{name}' not found")
+    weaver = weavers.get(server_name)
+    if not weaver or name not in weaver.apis:
+        raise HTTPException(status_code=404, detail=f"API '{name}' not found on server '{server_name}'")
 
     api_config = weaver.apis[name]
     # Remove tools
@@ -127,14 +148,17 @@ async def admin_unregister(payload: UnregisterPayload):
     # Remove config
     del weaver.apis[name]
     # Persist removal
-    await store.remove_api(name)
-    return {"status": "ok", "message": f"Unregistered {name}"}
+    await store.remove_api(server_name, name)
+    return {"status": "ok", "message": f"Unregistered {name} from server {server_name}"}
 
-@app.get("/admin/list")
-async def admin_list():
+@app.get("/admin/{server_name}/list")
+async def admin_list(server_name: str):
     """
-    Return a similar structure to the MCP tool list_apis.
+    Return all registered APIs for the given server (similar to list_apis tool).
     """
+    weaver = weavers.get(server_name)
+    if not weaver:
+        return {}  # empty server
     result = {}
     for name, api in weaver.apis.items():
         result[name] = {
@@ -164,26 +188,27 @@ async def admin_list():
         }
     return result
 
-@app.post("/admin/test")
-async def admin_test(payload: TestPayload):
+@app.post("/admin/{server_name}/test")
+async def admin_test(server_name: str, payload: TestPayload):
     name = payload.api_name
-    if name not in weaver.apis:
-        raise HTTPException(status_code=404, detail=f"API '{name}' not found")
+    weaver = weavers.get(server_name)
+    if not weaver or name not in weaver.apis:
+        raise HTTPException(status_code=404, detail=f"API '{name}' not found on server '{server_name}'")
     client = weaver.http_clients.get(name)
     if not client:
         raise HTTPException(status_code=500, detail=f"No HTTP client for '{name}'")
     api_config = weaver.apis[name]
     try:
-        # Try HEAD first, fallback to GET
         resp = await client.head(api_config.base_url, timeout=5.0)
         return {"status": "connected", "status_code": resp.status_code, "headers": dict(resp.headers)}
     except Exception as e:
         return {"status": "failed", "error": str(e)}
 
-@app.get("/admin/schema/{api_name}")
-async def admin_schema(api_name: str, endpoint: Optional[str] = None):
-    if api_name not in weaver.apis:
-        raise HTTPException(status_code=404, detail=f"API '{api_name}' not found")
+@app.get("/admin/{server_name}/schema/{api_name}")
+async def admin_schema(server_name: str, api_name: str, endpoint: Optional[str] = None):
+    weaver = weavers.get(server_name)
+    if not weaver or api_name not in weaver.apis:
+        raise HTTPException(status_code=404, detail=f"API '{api_name}' not found on server '{server_name}'")
     api_config = weaver.apis[api_name]
     if endpoint:
         ep = next((e for e in api_config.endpoints if e.name == endpoint), None)
@@ -242,25 +267,33 @@ async def shutdown_event():
     # Persist current configs on shutdown (defensive)
     try:
         to_save = {}
-        for name, api in weaver.apis.items():
-            # api may be Pydantic model or dict-like; attempt to export
-            try:
-                cfg = api.dict()
-            except Exception:
-                # Fallback: try to reconstruct minimal dict
-                cfg = {
-                    "name": api.name,
-                    "base_url": api.base_url,
-                    "description": getattr(api, "description", None),
-                    "auth": getattr(api, "auth", None),
-                    "headers": getattr(api, "headers", None),
-                    "endpoints": [ep.dict() if hasattr(ep, "dict") else ep for ep in api.endpoints]
-                }
-            to_save[name] = cfg
-        await store.save_all(to_save)
+        for server_name, weaver in weavers.items():
+            server_cfg = {}
+            for name, api in weaver.apis.items():
+                try:
+                    cfg = api.dict()
+                except Exception:
+                    cfg = {
+                        "name": api.name,
+                        "base_url": api.base_url,
+                        "description": getattr(api, "description", None),
+                        "auth": getattr(api, "auth", None),
+                        "headers": getattr(api, "headers", None),
+                        "endpoints": [ep.dict() if hasattr(ep, "dict") else ep for ep in api.endpoints]
+                    }
+                server_cfg[name] = cfg
+            to_save[server_name] = server_cfg
+        await store.save_server("__all__", {})  # noop ensure file exists (not required)
+        # write whole structure
+        # Use store._write_file directly under lock to replace full file
+        async with store._lock:
+            all_existing = await store._read_file()
+            # merge with others if present
+            all_existing.update(to_save)
+            await store._write_file(all_existing)
     except Exception as e:
         print(f"[admin shutdown] failed to save configs: {e}")
 
-# If you want to run this admin server directly:
+# Run admin server standalone:
 if __name__ == "__main__":
     uvicorn.run("apiweaver.admin_http:app", host="127.0.0.1", port=9000, reload=False)
